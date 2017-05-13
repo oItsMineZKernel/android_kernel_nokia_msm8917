@@ -384,6 +384,10 @@ static inline int __must_check kstrtos32_from_user(const char __user *s, size_t 
 	return kstrtoint_from_user(s, count, base, res);
 }
 
+#define strict_strtoul	kstrtoul
+#define strict_strtol	kstrtol
+#define strict_strtoull	kstrtoull
+#define strict_strtoll	kstrtoll
 /* Obsolete, do not use.  Use kstrto<foo> instead */
 
 extern unsigned long simple_strtoul(const char *,char **,unsigned int);
