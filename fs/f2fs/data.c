@@ -2206,8 +2206,8 @@ retry:
 	while (!done && (index <= end)) {
 		int i;
 
-		nr_pages = pagevec_lookup_range_tag(&pvec, mapping, &index, end,
-				tag);
+		nr_pages = pagevec_lookup_tag(&pvec, mapping, &index, tag,
+			      min(end - index, (pgoff_t)PAGEVEC_SIZE - 1) + 1);
 		if (nr_pages == 0)
 			break;
 
@@ -2216,8 +2216,13 @@ retry:
 			bool submitted = false;
 
 			/* give a priority to WB_SYNC threads */
-			if (atomic_read(&sbi->wb_sync_req[DATA]) &&
+			if (atomic_read(&F2FS_M_SB(mapping)->wb_sync_req) &&
 					wbc->sync_mode == WB_SYNC_NONE) {
+				done = 1;
+				break;
+			}
+
+			if (page->index > end) {
 				done = 1;
 				break;
 			}
@@ -2360,8 +2365,8 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 
 	/* to avoid spliting IOs due to mixed WB_SYNC_ALL and WB_SYNC_NONE */
 	if (wbc->sync_mode == WB_SYNC_ALL)
-		atomic_inc(&sbi->wb_sync_req[DATA]);
-	else if (atomic_read(&sbi->wb_sync_req[DATA]))
+		atomic_inc(&sbi->wb_sync_req);
+	else if (atomic_read(&sbi->wb_sync_req))
 		goto skip_write;
 
 	if (__should_serialize_io(inode, wbc)) {
@@ -2377,7 +2382,7 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 		mutex_unlock(&sbi->writepages);
 
 	if (wbc->sync_mode == WB_SYNC_ALL)
-		atomic_dec(&sbi->wb_sync_req[DATA]);
+		atomic_dec(&sbi->wb_sync_req);
 	/*
 	 * if some pages were truncated, we cannot guarantee its mapping->host
 	 * to detect pending bios.
