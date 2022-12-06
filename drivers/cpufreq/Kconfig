@@ -135,6 +135,7 @@ config CPU_FREQ_DEFAULT_GOV_SCHED
 	bool "sched"
 	select CPU_FREQ_GOV_INTERACTIVE
 	help
+
 config CPU_FREQ_DEFAULT_GOV_BLU_ACTIVE
 	bool "blu_active"
 	select CPU_FREQ_GOV_BLU_ACTIVE
@@ -311,6 +312,12 @@ config CPU_FREQ_GOV_CAFACTIVE
 
 	  If in doubt, say N.
 
+config CPU_FREQ_GOV_ELECTRON
+        tristate "'electron' cpufreq governor"
+        depends on CPU_FREQ
+        help
+          'electron' - another tuned interactive with extra options
+
 comment "CPU frequency scaling drivers"
 
 config CPUFREQ_DT
@@ -336,12 +343,6 @@ config CPU_BOOST
 	  - Migration of important threads from one CPU to another.
 
 	  If in doubt, say N.
-
-config CPU_FREQ_GOV_ELECTRON
-	tristate "'electron' cpufreq governor"
-	depends on CPU_FREQ
-	help
-	  'electron' - another tuned interactive with extra options
 
 menu "x86 CPU frequency scaling drivers"
 depends on X86
