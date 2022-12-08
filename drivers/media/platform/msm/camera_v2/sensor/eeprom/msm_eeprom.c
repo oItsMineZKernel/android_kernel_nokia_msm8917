@@ -552,8 +552,8 @@ static int eeprom_parse_memory_map(struct msm_eeprom_ctrl_t *e_ctrl,
 		}
 	}
 	memptr = e_ctrl->cal_data.mapdata;
-	for (i = 0; i < e_ctrl->cal_data.num_data; i++)
-		CDBG("memory_data[%d] = 0x%X\n", i, memptr[i]);
+//	for (i = 0; i < e_ctrl->cal_data.num_data; i++)
+//		CDBG_V("memory_data[%x] = 0x%X\n", i, memptr[i]);
 	return rc;
 
 clean_up:
@@ -1717,7 +1717,7 @@ static long msm_eeprom_subdev_fops_ioctl32(struct file *file, unsigned int cmd,
 static int msm_eeprom_platform_probe(struct platform_device *pdev)
 {
 	int rc = 0;
-	int j = 0;
+//	int j = 0;
 	uint32_t temp;
 
 	struct msm_camera_cci_client *cci_client = NULL;
@@ -1859,9 +1859,9 @@ static int msm_eeprom_platform_probe(struct platform_device *pdev)
 			pr_err("%s read_eeprom_memory failed\n", __func__);
 			goto power_down;
 		}
-		for (j = 0; j < e_ctrl->cal_data.num_data; j++)
-			CDBG("memory_data[%d] = 0x%X\n", j,
-				e_ctrl->cal_data.mapdata[j]);
+//		for (j = 0; j < e_ctrl->cal_data.num_data; j++)
+//			CDBG("memory_data[%d] = 0x%X\n", j,
+//				e_ctrl->cal_data.mapdata[j]);
 
 		e_ctrl->is_supported |= msm_eeprom_match_crc(&e_ctrl->cal_data);
 
