@@ -321,6 +321,30 @@ static unsigned ks8851_rdreg16(struct ks8851_net *ks, unsigned reg)
  * @reg: The register address
  *
  * Read a 8bit register from the chip, returning the result
+ * ks8851_rdreg32 - read 32 bit register from device
+ * @ks: The chip information
+ * @reg: The register address
+ *
+ * Read a 32bit register from the chip.
+ *
+ * Note, this read requires the address be aligned to 4 bytes.
+*/
+static unsigned ks8851_rdreg32(struct ks8851_net *ks, unsigned reg)
+{
+	__le32 rx = 0;
+
+	WARN_ON(reg & 3);
+
+	ks8851_rdreg(ks, MK_OP(0xf, reg), (u8 *)&rx, 4);
+	return le32_to_cpu(rx);
+}
+
+/**
+ * ks8851_rdreg8 - read 8 bit register from device
+ * @ks: The chip information
+ * @reg: The register address
+ *
+ * Read a 8bit register from the chip, returning the result
 */
 static unsigned ks8851_rdreg8(struct ks8851_net *ks, unsigned reg)
 {
@@ -610,6 +634,8 @@ static void ks8851_rx_pkts3(struct ks8851_net *ks)
 	u32 *buf32 = NULL;
 	u16 rxlen32 = 0;
 	u16 index32 = 0;
+	u32 rxh;
+	u16 rxstat;
 
 	/* read in fame count from ks8851 reg*/
 	rxfc = ks8851_rdreg8(ks, KS_RXFC);
