@@ -190,16 +190,21 @@ toolchain ()
     if test -d "toolchain"; then
         quotes "arm-linux-androideabi-4.9 Directory Found!"
     else
-        quotes "Add arm-linux-androideabi-4.9 as Submodule"
-        git submodule add -f https://github.com/arter97/arm-linux-androideabi-4.9 toolchain/arm-linux-androideabi-4.9 > /dev/null
-        check "arm-linux-androideabi-4.9"
+        quotes "Add Clang 9.0.3 (Based on r353983c) as Submodule"
+        git submodule add -f -q https://github.com/arter97/arm-linux-androideabi-4.9 toolchain/arm-linux-androideabi-4.9 > /dev/null
+        git submodule add -f -q https://github.com/dandelion64-Archives/clang-r353983c toolchain/clang-r353983c > /dev/null
+        check "clang-r353983c"
     fi
 
-    GCC=$DIR/toolchain/arm-linux-androideabi-4.9/bin/
+    CLANG=$DIR/toolchain/clang-r353983c/bin/
+    GCC=$DIR/toolchain/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-
+    PATH=$CLANG:$PATH
+
     ARGS="
         ARCH=arm O=out \
-        KCFLAGS=-mno-android \
-        CROSS_COMPILE=${GCC}arm-linux-androideabi- \
+        CC=clang \
+        CLANG_TRIPLE=${CLANG}arm-linux-gnueabi- \
+        CROSS_COMPILE=$GCC \
     "
 }
 
