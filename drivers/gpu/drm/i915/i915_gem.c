@@ -5131,6 +5131,77 @@ void i915_gem_track_fb(struct drm_i915_gem_object *old,
 	}
 }
 
+static bool mutex_is_locked_by(struct mutex *mutex, struct task_struct *task)
+{
+	if (!mutex_is_locked(mutex))
+		return false;
+
+#if defined(CONFIG_SMP) && !defined(CONFIG_DEBUG_MUTEXES)
+	return mutex->owner == task;
+#else
+	/* Since UP may be pre-empted, we cannot assume that we own the lock */
+	return false;
+#endif
+}
+
+static bool i915_gem_shrinker_lock(struct drm_device *dev, bool *unlock)
+{
+	if (!mutex_trylock(&dev->struct_mutex)) {
+		if (!mutex_is_locked_by(&dev->struct_mutex, current))
+			return false;
+
+		if (to_i915(dev)->mm.shrinker_no_lock_stealing)
+			return false;
+
+		*unlock = false;
+	} else
+		*unlock = true;
+
+	return true;
+}
+
+static int num_vma_bound(struct drm_i915_gem_object *obj)
+{
+	struct i915_vma *vma;
+	int count = 0;
+
+	list_for_each_entry(vma, &obj->vma_list, vma_link)
+		if (drm_mm_node_allocated(&vma->node))
+			count++;
+
+	return count;
+}
+
+static unsigned long
+i915_gem_shrinker_count(struct shrinker *shrinker, struct shrink_control *sc)
+{
+	struct drm_i915_private *dev_priv =
+		container_of(shrinker, struct drm_i915_private, mm.shrinker);
+	struct drm_device *dev = dev_priv->dev;
+	struct drm_i915_gem_object *obj;
+	unsigned long count;
+	bool unlock;
+
+	if (!i915_gem_shrinker_lock(dev, &unlock))
+		return 0;
+
+	count = 0;
+	list_for_each_entry(obj, &dev_priv->mm.unbound_list, global_list)
+		if (obj->pages_pin_count == 0)
+			count += obj->base.size >> PAGE_SHIFT;
+
+	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_list) {
+		if (!i915_gem_obj_is_pinned(obj) &&
+		    obj->pages_pin_count == num_vma_bound(obj))
+			count += obj->base.size >> PAGE_SHIFT;
+	}
+
+	if (unlock)
+		mutex_unlock(&dev->struct_mutex);
+
+	return count;
+}
+
 /* All the new VM stuff */
 u64 i915_gem_obj_offset(struct drm_i915_gem_object *o,
 			struct i915_address_space *vm)

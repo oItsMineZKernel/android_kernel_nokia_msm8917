@@ -100,7 +100,7 @@ static void __usbhsf_pkt_del(struct usbhs_pkt *pkt)
 	list_del_init(&pkt->node);
 }
 
-static struct usbhs_pkt *__usbhsf_pkt_get(struct usbhs_pipe *pipe)
+struct usbhs_pkt *__usbhsf_pkt_get(struct usbhs_pipe *pipe)
 {
 	if (list_empty(&pipe->list))
 		return NULL;
@@ -141,6 +141,8 @@ struct usbhs_pkt *usbhs_pkt_pop(struct usbhs_pipe *pipe, struct usbhs_pkt *pkt)
 			usbhsf_fifo_clear(pipe, fifo);
 			usbhsf_dma_unmap(pkt);
 		}
+
+		usbhs_pipe_running(pipe, 0);
 
 		__usbhsf_pkt_del(pkt);
 	}
@@ -824,6 +826,7 @@ static void xfer_work(struct work_struct *work)
 	struct dma_chan *chan = usbhsf_dma_chan_get(fifo, pkt);
 	struct device *dev = usbhs_priv_to_dev(priv);
 	enum dma_transfer_direction dir;
+	unsigned long flags;
 
 	dir = usbhs_pipe_is_dir_in(pipe) ? DMA_DEV_TO_MEM : DMA_MEM_TO_DEV;
 
@@ -831,14 +834,14 @@ static void xfer_work(struct work_struct *work)
 					pkt->trans, dir,
 					DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
 	if (!desc)
-		return;
+		goto xfer_work_end;
 
 	desc->callback		= usbhsf_dma_complete;
 	desc->callback_param	= pipe;
 
 	if (dmaengine_submit(desc) < 0) {
 		dev_err(dev, "Failed to submit dma descriptor\n");
-		return;
+		goto xfer_work_end;
 	}
 
 	dev_dbg(dev, "  %s %d (%d/ %d)\n",
@@ -849,6 +852,8 @@ static void xfer_work(struct work_struct *work)
 	usbhs_pipe_enable(pipe);
 	usbhsf_dma_start(pipe, fifo);
 	dma_async_issue_pending(chan);
+xfer_work_end:
+	usbhs_unlock(priv, flags);
 }
 
 /*

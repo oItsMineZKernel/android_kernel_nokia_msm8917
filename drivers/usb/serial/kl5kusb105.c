@@ -192,10 +192,11 @@ static int klsi_105_get_line_state(struct usb_serial_port *port,
 			     status_buf, KLSI_STATUSBUF_LEN,
 			     10000
 			     );
-	if (rc < 0)
-		dev_err(&port->dev, "Reading line status failed (error = %d)\n",
-			rc);
-	else {
+	if (rc != KLSI_STATUSBUF_LEN) {
+		dev_err(&port->dev, "reading line status failed: %d\n", rc);
+		if (rc >= 0)
+			rc = -EIO;
+	} else {
 		status = get_unaligned_le16(status_buf);
 
 		dev_info(&port->serial->dev->dev, "read status %x %x\n",
@@ -292,12 +293,12 @@ static int  klsi_105_open(struct tty_struct *tty, struct usb_serial_port *port)
 	priv->cfg.unknown2 = cfg->unknown2;
 	spin_unlock_irqrestore(&priv->lock, flags);
 
+	kfree(cfg);
+
 	/* READ_ON and urb submission */
 	rc = usb_serial_generic_open(tty, port);
-	if (rc) {
-		retval = rc;
-		goto exit;
-	}
+	if (rc)
+		return rc;
 
 	rc = usb_control_msg(port->serial->dev,
 			     usb_sndctrlpipe(port->serial->dev, 0),
@@ -324,8 +325,6 @@ static int  klsi_105_open(struct tty_struct *tty, struct usb_serial_port *port)
 	} else
 		retval = rc;
 
-exit:
-	kfree(cfg);
 	return retval;
 }
 

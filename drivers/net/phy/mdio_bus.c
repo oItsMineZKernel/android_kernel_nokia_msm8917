@@ -261,7 +261,6 @@ int mdiobus_register(struct mii_bus *bus)
 	err = device_register(&bus->dev);
 	if (err) {
 		pr_err("mii_bus %s failed to register\n", bus->id);
-		put_device(&bus->dev);
 		return -EINVAL;
 	}
 
@@ -300,7 +299,8 @@ void mdiobus_unregister(struct mii_bus *bus)
 {
 	int i;
 
-	BUG_ON(bus->state != MDIOBUS_REGISTERED);
+	if (WARN_ON_ONCE(bus->state != MDIOBUS_REGISTERED))
+		return;
 	bus->state = MDIOBUS_UNREGISTERED;
 
 	device_del(&bus->dev);

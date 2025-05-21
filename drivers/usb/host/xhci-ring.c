@@ -1248,33 +1248,44 @@ void xhci_handle_command_timeout(unsigned long data)
 	struct xhci_command *cur_cmd = NULL;
 	xhci = (struct xhci_hcd *) data;
 
-	/* mark this command to be cancelled */
 	spin_lock_irqsave(&xhci->lock, flags);
-	if (xhci->current_cmd) {
-		cur_cmd = xhci->current_cmd;
-		cur_cmd->status = COMP_CMD_ABORT;
+
+	/*
+	 * If timeout work is pending, or current_cmd is NULL, it means we
+	 * raced with command completion. Command is handled so just return.
+	 */
+	if (!xhci->current_cmd || timer_pending(&xhci->cmd_timer)) {
+		spin_unlock_irqrestore(&xhci->lock, flags);
+		return;
 	}
 
+	/* mark this command to be cancelled */
+	cur_cmd = xhci->current_cmd;
+	cur_cmd->status = COMP_CMD_ABORT;
 
 	/* Make sure command ring is running before aborting it */
 	hw_ring_state = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
 	if ((xhci->cmd_ring_state & CMD_RING_STATE_RUNNING) &&
 	    (hw_ring_state & CMD_RING_RUNNING))  {
-
-		spin_unlock_irqrestore(&xhci->lock, flags);
 		xhci_dbg(xhci, "Command timeout\n");
 		ret = xhci_abort_cmd_ring(xhci);
 		if (unlikely(ret == -ESHUTDOWN)) {
 			xhci_err(xhci, "Abort command ring failed\n");
 			xhci_cleanup_command_queue(xhci);
+			spin_unlock_irqrestore(&xhci->lock, flags);
 			usb_hc_died(xhci_to_hcd(xhci)->primary_hcd);
 			xhci_dbg(xhci, "xHCI host controller is dead.\n");
+
+			return;
 		}
-		return;
+
+		goto time_out_completed;
 	}
 	/* command timeout on stopped ring, ring can't be aborted */
 	xhci_dbg(xhci, "Command timeout on stopped ring\n");
 	xhci_handle_stopped_cmd_ring(xhci, xhci->current_cmd);
+
+time_out_completed:
 	spin_unlock_irqrestore(&xhci->lock, flags);
 	return;
 }
@@ -1332,8 +1343,11 @@ static void handle_cmd_completion(struct xhci_hcd *xhci,
 	 */
 	if (cmd_comp_code == COMP_CMD_ABORT) {
 		xhci->cmd_ring_state = CMD_RING_STATE_STOPPED;
-		if (cmd->status == COMP_CMD_ABORT)
+		if (cmd->status == COMP_CMD_ABORT) {
+			if (xhci->current_cmd == cmd)
+				xhci->current_cmd = NULL;
 			goto event_handled;
+		}
 	}
 
 	cmd_type = TRB_FIELD_TO_TYPE(le32_to_cpu(cmd_trb->generic.field[3]));
@@ -1395,6 +1409,8 @@ static void handle_cmd_completion(struct xhci_hcd *xhci,
 		xhci->current_cmd = list_entry(cmd->cmd_list.next,
 					       struct xhci_command, cmd_list);
 		mod_timer(&xhci->cmd_timer, jiffies + XHCI_CMD_DEFAULT_TIMEOUT);
+	} else if (xhci->current_cmd == cmd) {
+		xhci->current_cmd = NULL;
 	}
 
 event_handled:
@@ -1566,6 +1582,7 @@ static void handle_port_status(struct xhci_hcd *xhci,
 			bus_state->port_remote_wakeup |= 1 << faked_port_index;
 			xhci_test_and_clear_bit(xhci, port_array,
 					faked_port_index, PORT_PLC);
+			usb_hcd_start_port_resume(&hcd->self, faked_port_index);
 			xhci_set_link_state(xhci, port_array, faked_port_index,
 						XDEV_U0);
 			/* Need to wait until the next link state change
@@ -1584,10 +1601,13 @@ static void handle_port_status(struct xhci_hcd *xhci,
 		}
 	}
 
-	if ((temp & PORT_PLC) && (temp & PORT_PLS_MASK) == XDEV_U0 &&
-			DEV_SUPERSPEED(temp)) {
+	if ((temp & PORT_PLC) &&
+	    DEV_SUPERSPEED(temp) &&
+	    ((temp & PORT_PLS_MASK) == XDEV_U0 ||
+	     (temp & PORT_PLS_MASK) == XDEV_U1 ||
+	     (temp & PORT_PLS_MASK) == XDEV_U2)) {
 		xhci_dbg(xhci, "resume SS port %d finished\n", port_id);
-		/* We've just brought the device into U0 through either the
+		/* We've just brought the device into U0/1/2 through either the
 		 * Resume state after a device remote wakeup, or through the
 		 * U3Exit state after a host-initiated resume.  If it's a device
 		 * initiated remote wake, don't pass up the link state change,
@@ -1599,8 +1619,6 @@ static void handle_port_status(struct xhci_hcd *xhci,
 		if (slot_id && xhci->devs[slot_id])
 			xhci_ring_device(xhci, slot_id);
 		if (bus_state->port_remote_wakeup & (1 << faked_port_index)) {
-			bus_state->port_remote_wakeup &=
-				~(1 << faked_port_index);
 			xhci_test_and_clear_bit(xhci, port_array,
 					faked_port_index, PORT_PLC);
 			usb_wakeup_notification(hcd->self.root_hub,
@@ -1615,7 +1633,7 @@ static void handle_port_status(struct xhci_hcd *xhci,
 	 * RExit to a disconnect state).  If so, let the the driver know it's
 	 * out of the RExit state.
 	 */
-	if (!DEV_SUPERSPEED(temp) &&
+	if (!DEV_SUPERSPEED(temp) && hcd->speed < HCD_USB3 &&
 			test_and_clear_bit(faked_port_index,
 				&bus_state->rexit_ports)) {
 		complete(&bus_state->rexit_done[faked_port_index]);
@@ -2748,6 +2766,8 @@ static void queue_trb(struct xhci_hcd *xhci, struct xhci_ring *ring,
 	trb->field[0] = cpu_to_le32(field1);
 	trb->field[1] = cpu_to_le32(field2);
 	trb->field[2] = cpu_to_le32(field3);
+	/* make sure TRB is fully written before giving it to the controller */
+	wmb();
 	trb->field[3] = cpu_to_le32(field4);
 	inc_enq(xhci, ring, more_trbs_coming);
 }
@@ -3631,7 +3651,7 @@ static unsigned int xhci_get_burst_count(struct xhci_hcd *xhci,
 {
 	unsigned int max_burst;
 
-	if (xhci->hci_version < 0x100 || udev->speed != USB_SPEED_SUPER)
+	if (xhci->hci_version < 0x100 || udev->speed < USB_SPEED_SUPER)
 		return 0;
 
 	max_burst = urb->ep->ss_ep_comp.bMaxBurst;
@@ -3657,6 +3677,7 @@ static unsigned int xhci_get_last_burst_packet_count(struct xhci_hcd *xhci,
 		return 0;
 
 	switch (udev->speed) {
+	case USB_SPEED_SUPER_PLUS:
 	case USB_SPEED_SUPER:
 		/* bMaxBurst is zero based: 0 means 1 packet per burst */
 		max_burst = urb->ep->ss_ep_comp.bMaxBurst;

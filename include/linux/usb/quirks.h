@@ -50,4 +50,7 @@
 /* device can't handle Link Power Management */
 #define USB_QUIRK_NO_LPM			BIT(10)
 
+/* device has blacklisted endpoints */
+#define USB_QUIRK_ENDPOINT_BLACKLIST		BIT(15)
+
 #endif /* __LINUX_USB_QUIRKS_H */

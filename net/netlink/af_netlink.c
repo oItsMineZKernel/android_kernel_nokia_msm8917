@@ -61,6 +61,7 @@
 #include <linux/rhashtable.h>
 #include <asm/cacheflush.h>
 #include <linux/hash.h>
+#include <linux/nospec.h>
 
 #include <net/net_namespace.h>
 #include <net/sock.h>
@@ -371,14 +372,11 @@ static void netlink_skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
 	sk_mem_charge(sk, skb->truesize);
 }
 
-static void netlink_sock_destruct(struct sock *sk)
+static void __netlink_sock_destruct(struct sock *sk)
 {
 	struct netlink_sock *nlk = nlk_sk(sk);
 
 	if (nlk->cb_running) {
-		if (nlk->cb.done)
-			nlk->cb.done(&nlk->cb);
-
 		module_put(nlk->cb.module);
 		kfree_skb(nlk->cb.skb);
 	}
@@ -393,6 +391,28 @@ static void netlink_sock_destruct(struct sock *sk)
 	WARN_ON(atomic_read(&sk->sk_rmem_alloc));
 	WARN_ON(atomic_read(&sk->sk_wmem_alloc));
 	WARN_ON(nlk_sk(sk)->groups);
+}
+
+static void netlink_sock_destruct_work(struct work_struct *work)
+{
+	struct netlink_sock *nlk = container_of(work, struct netlink_sock,
+						work);
+
+	nlk->cb.done(&nlk->cb);
+	__netlink_sock_destruct(&nlk->sk);
+}
+
+static void netlink_sock_destruct(struct sock *sk)
+{
+	struct netlink_sock *nlk = nlk_sk(sk);
+
+	if (nlk->cb_running && nlk->cb.done) {
+		INIT_WORK(&nlk->work, netlink_sock_destruct_work);
+		schedule_work(&nlk->work);
+		return;
+	}
+
+	__netlink_sock_destruct(sk);
 }
 
 /* This lock without WQ_FLAG_EXCLUSIVE is good on UP and it is _very_ bad on
@@ -436,11 +456,13 @@ void netlink_table_ungrab(void)
 static inline void
 netlink_lock_table(void)
 {
+	unsigned long flags;
+
 	/* read_lock() synchronizes us to netlink_table_grab */
 
-	read_lock(&nl_table_lock);
+	read_lock_irqsave(&nl_table_lock, flags);
 	atomic_inc(&nl_table_users);
-	read_unlock(&nl_table_lock);
+	read_unlock_irqrestore(&nl_table_lock, flags);
 }
 
 static inline void
@@ -617,6 +639,7 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
 
 	if (protocol < 0 || protocol >= MAX_LINKS)
 		return -EPROTONOSUPPORT;
+	protocol = array_index_nospec(protocol, MAX_LINKS);
 
 	netlink_lock_table();
 #ifdef CONFIG_MODULES
@@ -914,6 +937,11 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 		if (err)
 			return err;
 	}
+
+	if (nlk->ngroups == 0)
+		groups = 0;
+	else if (nlk->ngroups < 8*sizeof(groups))
+		groups &= (1UL << nlk->ngroups) - 1;
 
 	if (nlk->portid)
 		if (nladdr->nl_pid != nlk->portid)
@@ -1977,6 +2005,7 @@ static int netlink_dump(struct sock *sk)
 	struct nlmsghdr *nlh;
 	struct module *module;
 	int err = -ENOBUFS;
+	int alloc_min_size;
 	int alloc_size;
 
 	mutex_lock(nlk->cb_mutex);
@@ -1984,9 +2013,6 @@ static int netlink_dump(struct sock *sk)
 		err = -EINVAL;
 		goto errout_skb;
 	}
-
-	cb = &nlk->cb;
-	alloc_size = max_t(int, cb->min_dump_alloc, NLMSG_GOODSIZE);
 
 	if (atomic_read(&sk->sk_rmem_alloc) >= sk->sk_rcvbuf)
 		goto errout_skb;
@@ -1996,22 +2022,34 @@ static int netlink_dump(struct sock *sk)
 	 * to reduce number of system calls on dump operations, if user
 	 * ever provided a big enough buffer.
 	 */
-	if (alloc_size < nlk->max_recvmsg_len) {
-		skb = netlink_alloc_skb(sk,
-					nlk->max_recvmsg_len,
-					nlk->portid,
+	cb = &nlk->cb;
+	alloc_min_size = max_t(int, cb->min_dump_alloc, NLMSG_GOODSIZE);
+
+	if (alloc_min_size < nlk->max_recvmsg_len) {
+		alloc_size = nlk->max_recvmsg_len;
+		skb = netlink_alloc_skb(sk, alloc_size, nlk->portid,
 					(GFP_KERNEL & ~__GFP_WAIT) |
 					__GFP_NOWARN | __GFP_NORETRY);
-		/* available room should be exact amount to avoid MSG_TRUNC */
-		if (skb)
-			skb_reserve(skb, skb_tailroom(skb) -
-					 nlk->max_recvmsg_len);
 	}
-	if (!skb)
+	if (!skb) {
+		alloc_size = alloc_min_size;
 		skb = netlink_alloc_skb(sk, alloc_size, nlk->portid,
 					(GFP_KERNEL & ~__GFP_WAIT));
+	}
 	if (!skb)
 		goto errout_skb;
+
+	/* Trim skb to allocated size. User is expected to provide buffer as
+	 * large as max(min_dump_alloc, 16KiB (mac_recvmsg_len capped at
+	 * netlink_recvmsg())). dump will pack as many smaller messages as
+	 * could fit within the allocated skb. skb is typically allocated
+	 * with larger space than required (could be as much as near 2x the
+	 * requested size with align to next power of 2 approach). Allowing
+	 * dump to use the excess space makes it difficult for a user to have a
+	 * reasonable static buffer based on the expected largest dump of a
+	 * single netdev. The outcome is MSG_TRUNC error.
+	 */
+	skb_reserve(skb, skb_tailroom(skb) - alloc_size);
 	netlink_skb_set_owner_r(skb, sk);
 
 	if (nlk->dump_done_errno > 0)

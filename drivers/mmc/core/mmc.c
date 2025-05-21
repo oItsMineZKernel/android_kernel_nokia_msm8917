@@ -587,7 +587,7 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 			card->ext_csd.bkops_en = ext_csd[EXT_CSD_BKOPS_EN];
 			card->ext_csd.raw_bkops_status =
 				ext_csd[EXT_CSD_BKOPS_STATUS];
-			pr_info("%s: BKOPS_EN equals 0x%x\n",
+			pr_debug("%s: BKOPS_EN equals 0x%x\n",
 					mmc_hostname(card->host),
 					card->ext_csd.bkops_en);
 
@@ -1049,7 +1049,7 @@ static int mmc_select_bus_width(struct mmc_card *card)
 			break;
 		} else {
 			pr_warn("%s: switch to bus width %d failed\n",
-				mmc_hostname(host), ext_csd_bits[idx]);
+				mmc_hostname(host), 1 << bus_width);
 		}
 	}
 
@@ -1921,10 +1921,10 @@ reinit:
 		err = mmc_select_hs400(card);
 		if (err)
 			goto err;
-	} else if (mmc_card_hs(card)) {
+	} else {
 		/* Select the desired bus width optionally */
 		err = mmc_select_bus_width(card);
-		if (!IS_ERR_VALUE(err)) {
+		if (!IS_ERR_VALUE(err) && mmc_card_hs(card)) {
 			err = mmc_select_hs_ddr(card);
 			if (err)
 				goto err;
@@ -1961,9 +1961,11 @@ reinit:
 		if (err) {
 			pr_warn("%s: Enabling HPI failed\n",
 				mmc_hostname(card->host));
+			card->ext_csd.hpi_en = 0;
 			err = 0;
-		} else
+		} else {
 			card->ext_csd.hpi_en = 1;
+		}
 	}
 
 	/*

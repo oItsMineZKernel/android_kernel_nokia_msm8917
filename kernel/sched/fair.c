@@ -1125,8 +1125,6 @@ static void task_numa_assign(struct task_numa_env *env,
 {
 	if (env->best_task)
 		put_task_struct(env->best_task);
-	if (p)
-		get_task_struct(p);
 
 	env->best_task = p;
 	env->best_imp = imp;
@@ -1193,20 +1191,30 @@ static void task_numa_compare(struct task_numa_env *env,
 	long load;
 	long imp = env->p->numa_group ? groupimp : taskimp;
 	long moveimp = imp;
+	bool assigned = false;
 
 	rcu_read_lock();
 
 	raw_spin_lock_irq(&dst_rq->lock);
 	cur = dst_rq->curr;
 	/*
-	 * No need to move the exiting task, and this ensures that ->curr
-	 * wasn't reaped and thus get_task_struct() in task_numa_assign()
-	 * is safe under RCU read lock.
-	 * Note that rcu_read_lock() itself can't protect from the final
-	 * put_task_struct() after the last schedule().
+	 * No need to move the exiting task or idle task.
 	 */
 	if ((cur->flags & PF_EXITING) || is_idle_task(cur))
 		cur = NULL;
+	else {
+		/*
+		 * The task_struct must be protected here to protect the
+		 * p->numa_faults access in the task_weight since the
+		 * numa_faults could already be freed in the following path:
+		 * finish_task_switch()
+		 *     --> put_task_struct()
+		 *         --> __put_task_struct()
+		 *             --> task_numa_free()
+		 */
+		get_task_struct(cur);
+	}
+
 	raw_spin_unlock_irq(&dst_rq->lock);
 
 	/*
@@ -1290,6 +1298,7 @@ balance:
 		 */
 		if (!load_too_imbalanced(src_load, dst_load, env)) {
 			imp = moveimp - 1;
+			put_task_struct(cur);
 			cur = NULL;
 			goto assign;
 		}
@@ -1315,9 +1324,16 @@ balance:
 		env->dst_cpu = select_idle_sibling(env->p, env->dst_cpu);
 
 assign:
+	assigned = true;
 	task_numa_assign(env, cur, imp);
 unlock:
 	rcu_read_unlock();
+	/*
+	 * The dst_rq->curr isn't assigned. The protection for task_struct is
+	 * finished.
+	 */
+	if (cur && !assigned)
+		put_task_struct(cur);
 }
 
 static void task_numa_find_cpu(struct task_numa_env *env,
@@ -1594,6 +1610,10 @@ static u64 numa_get_avg_runtime(struct task_struct *p, u64 *period)
 	if (p->last_task_numa_placement) {
 		delta = runtime - p->last_sum_exec_runtime;
 		*period = now - p->last_task_numa_placement;
+
+		/* Avoid time going backwards, prevent potential divide error: */
+		if (unlikely((s64)*period < 0))
+			*period = 0;
 	} else {
 		delta = p->se.avg.runnable_avg_sum;
 		*period = p->se.avg.runnable_avg_period;
@@ -1996,7 +2016,8 @@ void task_numa_work(struct callback_head *work)
 	if (!pages)
 		return;
 
-	down_read(&mm->mmap_sem);
+	if (!down_read_trylock(&mm->mmap_sem))
+		return;
 	vma = find_vma(mm, start);
 	if (!vma) {
 		reset_ptenuma_scan(p);
@@ -2073,7 +2094,7 @@ void task_tick_numa(struct rq *rq, struct task_struct *curr)
 	/*
 	 * We don't care about NUMA placement if we don't have memory.
 	 */
-	if (!curr->mm || (curr->flags & PF_EXITING) || work->next != work)
+	if ((curr->flags & (PF_EXITING | PF_KTHREAD)) || work->next != work)
 		return;
 
 	/*
@@ -2142,28 +2163,22 @@ account_entity_dequeue(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 # ifdef CONFIG_SMP
-static inline long calc_tg_weight(struct task_group *tg, struct cfs_rq *cfs_rq)
-{
-	long tg_weight;
-
-	/*
-	 * Use this CPU's actual weight instead of the last load_contribution
-	 * to gain a more accurate current total weight. See
-	 * update_cfs_rq_load_contribution().
-	 */
-	tg_weight = atomic_long_read(&tg->load_avg);
-	tg_weight -= cfs_rq->tg_load_contrib;
-	tg_weight += cfs_rq->load.weight;
-
-	return tg_weight;
-}
-
 static long calc_cfs_shares(struct cfs_rq *cfs_rq, struct task_group *tg)
 {
 	long tg_weight, load, shares;
 
-	tg_weight = calc_tg_weight(tg, cfs_rq);
-	load = cfs_rq->load.weight;
+	/*
+	 * This really should be: cfs_rq->avg.load_avg, but instead we use
+	 * cfs_rq->load.weight, which is its upper bound. This helps ramp up
+	 * the shares for small weight interactive tasks.
+	 */
+	load = scale_load_down(cfs_rq->load.weight);
+
+	tg_weight = atomic_long_read(&tg->load_avg);
+
+	/* Ensure tg_weight >= load */
+	tg_weight -= cfs_rq->tg_load_avg_contrib;
+	tg_weight += load;
 
 	shares = (tg->shares * load);
 	if (tg_weight)
@@ -2182,6 +2197,7 @@ static inline long calc_cfs_shares(struct cfs_rq *cfs_rq, struct task_group *tg)
 	return tg->shares;
 }
 # endif /* CONFIG_SMP */
+
 static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
 {
@@ -5432,9 +5448,14 @@ static void throttle_cfs_rq(struct cfs_rq *cfs_rq)
 	raw_spin_lock(&cfs_b->lock);
 	/*
 	 * Add to the _head_ of the list, so that an already-started
-	 * distribute_cfs_runtime will not see us
+	 * distribute_cfs_runtime will not see us. If disribute_cfs_runtime is
+	 * not running add to the tail so that later runqueues don't get starved.
 	 */
-	list_add_rcu(&cfs_rq->throttled_list, &cfs_b->throttled_cfs_rq);
+	if (cfs_b->distribute_running)
+		list_add_rcu(&cfs_rq->throttled_list, &cfs_b->throttled_cfs_rq);
+	else
+		list_add_tail_rcu(&cfs_rq->throttled_list, &cfs_b->throttled_cfs_rq);
+
 	if (!cfs_b->timer_active)
 		__start_cfs_bandwidth(cfs_b, false);
 	raw_spin_unlock(&cfs_b->lock);
@@ -5594,14 +5615,16 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun)
 	 * in us over-using our runtime if it is all used during this loop, but
 	 * only by limited amounts in that extreme case.
 	 */
-	while (throttled && cfs_b->runtime > 0) {
+	while (throttled && cfs_b->runtime > 0 && !cfs_b->distribute_running) {
 		runtime = cfs_b->runtime;
+		cfs_b->distribute_running = 1;
 		raw_spin_unlock(&cfs_b->lock);
 		/* we can't nest cfs_b->lock while distributing bandwidth */
 		runtime = distribute_cfs_runtime(cfs_b, runtime,
 						 runtime_expires);
 		raw_spin_lock(&cfs_b->lock);
 
+		cfs_b->distribute_running = 0;
 		throttled = !list_empty(&cfs_b->throttled_cfs_rq);
 
 		cfs_b->runtime -= min(runtime, cfs_b->runtime);
@@ -5712,6 +5735,11 @@ static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
 
 	/* confirm we're still not at a refresh boundary */
 	raw_spin_lock(&cfs_b->lock);
+	if (cfs_b->distribute_running) {
+		raw_spin_unlock(&cfs_b->lock);
+		return;
+	}
+
 	if (runtime_refresh_within(cfs_b, min_bandwidth_expiration)) {
 		raw_spin_unlock(&cfs_b->lock);
 		return;
@@ -5721,6 +5749,9 @@ static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
 		runtime = cfs_b->runtime;
 
 	expires = cfs_b->runtime_expires;
+	if (runtime)
+		cfs_b->distribute_running = 1;
+
 	raw_spin_unlock(&cfs_b->lock);
 
 	if (!runtime)
@@ -5731,6 +5762,7 @@ static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
 	raw_spin_lock(&cfs_b->lock);
 	if (expires == cfs_b->runtime_expires)
 		cfs_b->runtime -= min(runtime, cfs_b->runtime);
+	cfs_b->distribute_running = 0;
 	raw_spin_unlock(&cfs_b->lock);
 }
 
@@ -5743,6 +5775,26 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq)
 {
 	if (!cfs_bandwidth_used())
 		return;
+
+	/* Synchronize hierarchical throttle counter: */
+	if (unlikely(!cfs_rq->throttle_uptodate)) {
+		struct rq *rq = rq_of(cfs_rq);
+		struct cfs_rq *pcfs_rq;
+		struct task_group *tg;
+
+		cfs_rq->throttle_uptodate = 1;
+
+		/* Get closest up-to-date node, because leaves go first: */
+		for (tg = cfs_rq->tg->parent; tg; tg = tg->parent) {
+			pcfs_rq = tg->cfs_rq[cpu_of(rq)];
+			if (pcfs_rq->throttle_uptodate)
+				break;
+		}
+		if (tg) {
+			cfs_rq->throttle_count = pcfs_rq->throttle_count;
+			cfs_rq->throttled_clock_task = rq_clock_task(rq);
+		}
+	}
 
 	/* an active group must be handled by the update_curr()->put() path */
 	if (!cfs_rq->runtime_enabled || cfs_rq->curr)
@@ -5787,6 +5839,8 @@ static enum hrtimer_restart sched_cfs_slack_timer(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
+extern const u64 max_cfs_quota_period;
+
 static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
 {
 	struct cfs_bandwidth *cfs_b =
@@ -5794,6 +5848,7 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
 	ktime_t now;
 	int overrun;
 	int idle = 0;
+	int count = 0;
 
 	raw_spin_lock(&cfs_b->lock);
 	for (;;) {
@@ -5802,6 +5857,36 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
 
 		if (!overrun)
 			break;
+
+		if (++count > 3) {
+			u64 new, old = ktime_to_ns(cfs_b->period);
+
+			/*
+			 * Grow period by a factor of 2 to avoid losing precision.
+			 * Precision loss in the quota/period ratio can cause __cfs_schedulable
+			 * to fail.
+			 */
+			new = old * 2;
+			if (new < max_cfs_quota_period) {
+				cfs_b->period = ns_to_ktime(new);
+				cfs_b->quota *= 2;
+
+				pr_warn_ratelimited(
+	"cfs_period_timer[cpu%d]: period too short, scaling up (new cfs_period_us = %lld, cfs_quota_us = %lld)\n",
+					smp_processor_id(),
+					div_u64(new, NSEC_PER_USEC),
+					div_u64(cfs_b->quota, NSEC_PER_USEC));
+			} else {
+				pr_warn_ratelimited(
+	"cfs_period_timer[cpu%d]: period too short, but cannot scale up without losing precision (cfs_period_us = %lld, cfs_quota_us = %lld)\n",
+					smp_processor_id(),
+					div_u64(old, NSEC_PER_USEC),
+					div_u64(cfs_b->quota, NSEC_PER_USEC));
+			}
+
+			/* reset count so we don't come right back in here */
+			count = 0;
+		}
 
 		idle = do_sched_cfs_period_timer(cfs_b, overrun);
 	}
@@ -5822,6 +5907,7 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
 	cfs_b->period_timer.function = sched_cfs_period_timer;
 	hrtimer_init(&cfs_b->slack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	cfs_b->slack_timer.function = sched_cfs_slack_timer;
+	cfs_b->distribute_running = 0;
 }
 
 static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
@@ -6072,15 +6158,14 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 		/* Don't dequeue parent if it has other entities besides us */
 		if (cfs_rq->load.weight) {
+			/* Avoid re-evaluating load for this entity: */
+			se = parent_entity(se);
 			/*
 			 * Bias pick_next to pick a task from this cfs_rq, as
 			 * p is sleeping when it is within its sched_slice.
 			 */
-			if (task_sleep && parent_entity(se))
-				set_next_buddy(parent_entity(se));
-
-			/* avoid re-evaluating load for this entity */
-			se = parent_entity(se);
+			if (task_sleep && se && !throttled_hierarchy(cfs_rq))
+				set_next_buddy(se);
 			break;
 		}
 		flags |= DEQUEUE_SLEEP;
@@ -6262,19 +6347,24 @@ static long effective_load(struct task_group *tg, int cpu, long wl, long wg)
 		return wl;
 
 	for_each_sched_entity(se) {
-		long w, W;
+		struct cfs_rq *cfs_rq = se->my_q;
+		long W, w = cfs_rq_load_avg(cfs_rq);
 
-		tg = se->my_q->tg;
+		tg = cfs_rq->tg;
 
 		/*
 		 * W = @wg + \Sum rw_j
 		 */
-		W = wg + calc_tg_weight(tg, se->my_q);
+		W = wg + atomic_long_read(&tg->load_avg);
+
+		/* Ensure \Sum rw_j >= rw_i */
+		W -= cfs_rq->tg_load_avg_contrib;
+		W += w;
 
 		/*
 		 * w = rw_i + @wl
 		 */
-		w = se->my_q->load.weight + wl;
+		w += wl;
 
 		/*
 		 * wl = S * s'_i; see (2)
@@ -7538,7 +7628,15 @@ redo:
 		if (!can_migrate_task(p, env))
 			goto next;
 
-		load = task_h_load(p);
+		/*
+		 * Depending of the number of CPUs and tasks and the
+		 * cgroup hierarchy, task_h_load() can return a null
+		 * value. Make sure that env->imbalance decreases
+		 * otherwise detach_tasks() will stop only after
+		 * detaching up to loop_max tasks.
+		 */
+		load = max_t(unsigned long, task_h_load(p), 1);
+
 
 		if (sched_feat(LB_MIN) && load < 16 && !env->sd->nr_balance_failed)
 			goto next;
@@ -7714,10 +7812,10 @@ static void update_cfs_rq_h_load(struct cfs_rq *cfs_rq)
 	if (cfs_rq->last_h_load_update == now)
 		return;
 
-	cfs_rq->h_load_next = NULL;
+	WRITE_ONCE(cfs_rq->h_load_next, NULL);
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
-		cfs_rq->h_load_next = se;
+		WRITE_ONCE(cfs_rq->h_load_next, se);
 		if (cfs_rq->last_h_load_update == now)
 			break;
 	}
@@ -7727,7 +7825,7 @@ static void update_cfs_rq_h_load(struct cfs_rq *cfs_rq)
 		cfs_rq->last_h_load_update = now;
 	}
 
-	while ((se = cfs_rq->h_load_next) != NULL) {
+	while ((se = READ_ONCE(cfs_rq->h_load_next)) != NULL) {
 		load = cfs_rq->h_load;
 		load = div64_ul(load * se->avg.load_avg_contrib,
 				cfs_rq->runnable_load_avg + 1);
@@ -9187,9 +9285,10 @@ no_move:
 out_balanced:
 	/*
 	 * We reach balance although we may have faced some affinity
-	 * constraints. Clear the imbalance flag if it was set.
+	 * constraints. Clear the imbalance flag only if other tasks got
+	 * a chance to move and fix the imbalance.
 	 */
-	if (sd_parent) {
+	if (sd_parent && !(env.flags & LBF_ALL_PINNED)) {
 		int *group_imbalance = &sd_parent->groups->sgc->imbalance;
 
 		if (*group_imbalance)
@@ -9207,13 +9306,22 @@ out_all_pinned:
 	sd->nr_balance_failed = 0;
 
 out_one_pinned:
+	ld_moved = 0;
+
+	/*
+	 * idle_balance() disregards balance intervals, so we could repeatedly
+	 * reach this code, which would lead to balance_interval skyrocketting
+	 * in a short amount of time. Skip the balance_interval increase logic
+	 * to avoid that.
+	 */
+	if (env.idle == CPU_NEWLY_IDLE)
+		goto out;
+
 	/* tune up the balancing interval */
 	if (((env.flags & LBF_ALL_PINNED) &&
 			sd->balance_interval < MAX_PINNED_INTERVAL) ||
 			(sd->balance_interval < sd->max_interval))
 		sd->balance_interval *= 2;
-
-	ld_moved = 0;
 out:
 	trace_sched_load_balance(this_cpu, idle, *continue_balancing,
 				 group ? group->cpumask[0] : 0,
@@ -10306,21 +10414,29 @@ err:
 	return 0;
 }
 
-void unregister_fair_sched_group(struct task_group *tg, int cpu)
+void unregister_fair_sched_group(struct task_group *tg)
 {
-	struct rq *rq = cpu_rq(cpu);
 	unsigned long flags;
+	struct rq *rq;
+	int cpu;
 
-	/*
-	* Only empty task groups can be destroyed; so we can speculatively
-	* check on_list without danger of it being re-added.
-	*/
-	if (!tg->cfs_rq[cpu]->on_list)
-		return;
+	for_each_possible_cpu(cpu) {
+		if (tg->se[cpu])
+			remove_entity_load_avg(tg->se[cpu]);
 
-	raw_spin_lock_irqsave(&rq->lock, flags);
-	list_del_leaf_cfs_rq(tg->cfs_rq[cpu]);
-	raw_spin_unlock_irqrestore(&rq->lock, flags);
+		/*
+		 * Only empty task groups can be destroyed; so we can speculatively
+		 * check on_list without danger of it being re-added.
+		 */
+		if (!tg->cfs_rq[cpu]->on_list)
+			continue;
+
+		rq = cpu_rq(cpu);
+
+		raw_spin_lock_irqsave(&rq->lock, flags);
+		list_del_leaf_cfs_rq(tg->cfs_rq[cpu]);
+		raw_spin_unlock_irqrestore(&rq->lock, flags);
+	}
 }
 
 void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
@@ -10402,7 +10518,7 @@ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
 	return 1;
 }
 
-void unregister_fair_sched_group(struct task_group *tg, int cpu) { }
+void unregister_fair_sched_group(struct task_group *tg) { }
 
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 
